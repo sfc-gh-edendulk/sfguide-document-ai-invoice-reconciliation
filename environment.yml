@@ -1,0 +1,37 @@
+name: invoice-ai-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python version
+  - python=3.11
+  
+  # Core Snowflake dependencies
+  - pip
+  
+  # Data processing and analysis
+  - pandas>=2.0.0
+  - numpy>=1.24.0
+  
+  # Visualization libraries
+  - matplotlib>=3.7.0
+  - seaborn>=0.12.0
+  
+  # Additional utilities
+  - python-dateutil>=2.8.0
+  - pytz>=2023.3
+  
+  # Development tools (optional)
+  - pytest>=7.4.0
+  - black>=23.0.0
+  - flake8>=6.0.0
+  
+  # Pip dependencies (packages not available via conda)
+  - pip:
+    - streamlit>=1.28.0
+    - snowflake-snowpark-python[pandas]>=1.9.0
+    - snowflake-connector-python>=3.0.0
+    - plotly>=5.15.0
+    - pypdfium2>=4.18.0
+    - streamlit-plotly-events>=0.0.6
+    - streamlit-aggrid>=0.3.4 

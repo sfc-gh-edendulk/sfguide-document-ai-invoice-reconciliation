@@ -1,0 +1,30 @@
+# Enhanced Invoice Intelligence Platform Requirements
+# Core Streamlit and Snowflake dependencies
+streamlit>=1.28.0
+snowflake-snowpark-python>=1.9.0
+snowflake-connector-python>=3.0.0
+
+# Data processing and analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization libraries
+plotly>=5.15.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# PDF processing
+pypdfium2>=4.18.0
+
+# Additional utilities
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# Optional: Enhanced Streamlit components
+streamlit-plotly-events>=0.0.6
+streamlit-aggrid>=0.3.4
+
+# Development and testing (optional)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0 
