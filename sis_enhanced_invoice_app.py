@@ -17,10 +17,21 @@ st.set_page_config(
 DB_NAME = "DOC_AI_QS_DB"
 SCHEMA_NAME = "DOC_AI_SCHEMA"
 
+# Table references
+RECONCILE_ITEMS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.RECONCILE_RESULTS_ITEMS"
+RECONCILE_TOTALS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.RECONCILE_RESULTS_TOTALS"
+BRONZE_TRANSACT_ITEMS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.TRANSACT_ITEMS"
+BRONZE_TRANSACT_TOTALS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS"
+BRONZE_DOCAI_ITEMS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.DOCAI_INVOICE_ITEMS"
+BRONZE_DOCAI_TOTALS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.DOCAI_INVOICE_TOTALS"
+GOLD_ITEMS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.GOLD_INVOICE_ITEMS"
+GOLD_TOTALS_TABLE = f"{DB_NAME}.{SCHEMA_NAME}.GOLD_INVOICE_TOTALS"
+
 # Initialize session state
 session_state_keys = [
     'processed_invoice_id', 'cached_mismatch_summary', 'chat_history',
-    'ai_insights_cache'
+    'ai_insights_cache', 'edited_transact_items', 'edited_transact_totals',
+    'docai_items', 'docai_totals'
 ]
 
 for key in session_state_keys:
@@ -40,622 +51,741 @@ def get_snowflake_connection():
 
 conn = get_snowflake_connection()
 
-# --- Enhanced AI Functions for SiS ---
+# Get current user for audit trail
+try:
+    current_user_result = conn.query("SELECT CURRENT_USER() as user")
+    CURRENT_USER = current_user_result.iloc[0]['USER']
+except:
+    CURRENT_USER = "unknown_user"
 
-def ai_fraud_risk_analysis(invoice_id):
-    """Enhanced fraud risk analysis using Cortex AI with statistical context"""
+# --- Reconciliation Functions ---
+@st.cache_data(ttl=600)
+def load_reconcile_data(status_filter='Pending Review'):
+    """Loads data from reconciliation tables, optionally filtering by review_status."""
     try:
-        # Get comprehensive invoice data with statistical context
+        # Use UNION ALL to get all invoice IDs needing review from both tables
         query = f"""
-        WITH invoice_stats AS (
-            SELECT 
-                t.invoice_id,
-                t.total,
-                t.invoice_date,
-                COUNT(i.product_name) as item_count,
-                AVG(i.unit_price) as avg_unit_price,
-                MAX(i.unit_price) as max_unit_price,
-                STDDEV(i.unit_price) as price_stddev,
-                -- Statistical context
-                (SELECT AVG(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS) as overall_avg,
-                (SELECT STDDEV(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS) as overall_stddev,
-                DAYOFWEEK(t.invoice_date) as day_of_week
-            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t
-            LEFT JOIN {DB_NAME}.{SCHEMA_NAME}.TRANSACT_ITEMS i ON t.invoice_id = i.invoice_id
-            WHERE t.invoice_id = '{invoice_id}'
-            GROUP BY t.invoice_id, t.total, t.invoice_date
-        )
-        SELECT *,
-               (total - overall_avg) / overall_stddev as z_score,
-               CASE WHEN day_of_week IN (1, 7) THEN 'Weekend' ELSE 'Weekday' END as day_type
-        FROM invoice_stats
+        SELECT DISTINCT invoice_id, review_status, last_reconciled_timestamp
+        FROM {RECONCILE_ITEMS_TABLE}
+        WHERE review_status = '{status_filter}' OR '{status_filter}' = 'All'
+        UNION
+        SELECT DISTINCT invoice_id, review_status, last_reconciled_timestamp
+        FROM {RECONCILE_TOTALS_TABLE}
+        WHERE review_status = '{status_filter}' OR '{status_filter}' = 'All'
+        ORDER BY last_reconciled_timestamp DESC
         """
-        
-        data = conn.query(query)
-        
-        if data.empty:
-            return {"risk_level": "Unknown", "analysis": "No data found for analysis", "risk_score": 0}
-        
-        row = data.iloc[0]
-        z_score = abs(row['Z_SCORE']) if pd.notna(row['Z_SCORE']) else 0
-        
-        # Enhanced AI prompt with more context
-        prompt = f"""
-        Perform a comprehensive fraud risk analysis for this invoice:
-        
-        INVOICE DETAILS:
-        - ID: {row['INVOICE_ID']}
-        - Amount: ${row['TOTAL']:,.2f}
-        - Date: {row['INVOICE_DATE']} ({row['DAY_TYPE']})
-        - Items Count: {row['ITEM_COUNT']}
-        - Average Item Price: ${row['AVG_UNIT_PRICE']:.2f}
-        - Price Range: ${row['MAX_UNIT_PRICE']:.2f} (max)
-        
-        STATISTICAL CONTEXT:
-        - Z-Score: {z_score:.2f} (how many standard deviations from average)
-        - Overall Average Invoice: ${row['OVERALL_AVG']:,.2f}
-        
-        RISK FACTORS TO CONSIDER:
-        1. Statistical outliers (Z-score > 2 is suspicious)
-        2. Weekend/holiday invoices (unusual timing)
-        3. Unusual pricing patterns
-        4. Round numbers or suspicious amounts
-        
-        Provide:
-        1. Risk Level: LOW/MEDIUM/HIGH
-        2. Risk Score: 0.0-1.0
-        3. Key risk factors identified
-        4. Recommended actions
-        
-        Format as: RISK_LEVEL|RISK_SCORE|ANALYSIS
-        """
-        
-        # Use Cortex Complete for analysis
-        ai_query = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${prompt}$$) as analysis"
-        ai_result = conn.query(ai_query)
-        ai_response = ai_result.iloc[0]['ANALYSIS'] if not ai_result.empty else "AI analysis unavailable"
-        
-        # Parse response
-        try:
-            parts = ai_response.split('|', 2)
-            if len(parts) >= 3:
-                return {
-                    "risk_level": parts[0].strip(),
-                    "risk_score": float(parts[1].strip()),
-                    "analysis": parts[2].strip(),
-                    "z_score": z_score,
-                    "day_type": row['DAY_TYPE']
-                }
-        except:
-            pass
-        
-        # Fallback statistical assessment
-        risk_level = "HIGH" if z_score > 3 else "MEDIUM" if z_score > 2 else "LOW"
-        risk_score = min(1.0, z_score / 3.0)
-        
-        return {
-            "risk_level": risk_level,
-            "risk_score": risk_score,
-            "analysis": ai_response,
-            "z_score": z_score,
-            "day_type": row['DAY_TYPE']
-        }
-        
-    except Exception as e:
-        return {"risk_level": "Error", "analysis": f"Analysis failed: {e}", "risk_score": 0}
+        reconcile_df = conn.query(query)
 
-def ai_invoice_categorization(invoice_id):
-    """AI-powered invoice categorization with confidence scoring"""
-    try:
-        # Get detailed product information
-        query = f"""
-        SELECT 
-            i.invoice_id,
-            LISTAGG(DISTINCT i.product_name, ', ') as products,
-            COUNT(DISTINCT i.product_name) as unique_products,
-            SUM(i.total_price) as total_amount,
-            AVG(i.unit_price) as avg_price,
-            t.invoice_date
-        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_ITEMS i
-        JOIN {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t ON i.invoice_id = t.invoice_id
-        WHERE i.invoice_id = '{invoice_id}'
-        GROUP BY i.invoice_id, t.invoice_date
-        """
-        
-        data = conn.query(query)
-        
-        if data.empty:
-            return {"category": "Unknown", "confidence": 0, "reasoning": "No product data found"}
-        
-        row = data.iloc[0]
-        
-        prompt = f"""
-        Categorize this business invoice based on detailed analysis:
-        
-        INVOICE DATA:
-        - Products: {row['PRODUCTS']}
-        - Number of unique products: {row['UNIQUE_PRODUCTS']}
-        - Total amount: ${row['TOTAL_AMOUNT']:,.2f}
-        - Average item price: ${row['AVG_PRICE']:,.2f}
-        - Date: {row['INVOICE_DATE']}
-        
-        CATEGORIES TO CHOOSE FROM:
-        1. Food & Beverages - groceries, restaurant supplies, catering
-        2. Office Supplies - stationery, equipment, furniture  
-        3. Technology - computers, software, electronics
-        4. Manufacturing - raw materials, components, tools
-        5. Services - consulting, maintenance, professional services
-        6. Travel & Entertainment - hotels, meals, events
-        7. Utilities - electricity, water, telecommunications
-        8. Other - miscellaneous or mixed categories
-        
-        Consider:
-        - Product types and their business use
-        - Spending patterns and amounts
-        - Industry context
-        
-        Respond in JSON format:
-        {{"category": "Category Name", "confidence": 0.95, "reasoning": "Detailed explanation"}}
-        """
-        
-        ai_query = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${prompt}$$) as response"
-        ai_result = conn.query(ai_query)
-        ai_response = ai_result.iloc[0]['RESPONSE'] if not ai_result.empty else "{}"
-        
-        try:
-            # Try to parse JSON response
-            result = json.loads(ai_response)
-            if all(key in result for key in ['category', 'confidence', 'reasoning']):
-                return result
-        except:
-            pass
-        
-        # Fallback: Simple rule-based categorization
-        products_lower = row['PRODUCTS'].lower()
-        if any(food in products_lower for food in ['bread', 'milk', 'eggs', 'chicken', 'rice', 'tomatoes']):
-            return {"category": "Food & Beverages", "confidence": 0.8, "reasoning": "Contains food items"}
+        # Load full details for display
+        if status_filter != 'All':
+            reconcile_items_full_df = conn.query(f"SELECT * FROM {RECONCILE_ITEMS_TABLE} WHERE review_status = '{status_filter}'")
+            reconcile_totals_full_df = conn.query(f"SELECT * FROM {RECONCILE_TOTALS_TABLE} WHERE review_status = '{status_filter}'")
         else:
-            return {"category": "Other", "confidence": 0.5, "reasoning": "Could not determine category from AI"}
-            
-    except Exception as e:
-        return {"category": "Error", "confidence": 0, "reasoning": f"Categorization failed: {e}"}
+            reconcile_items_full_df = conn.query(f"SELECT * FROM {RECONCILE_ITEMS_TABLE}")
+            reconcile_totals_full_df = conn.query(f"SELECT * FROM {RECONCILE_TOTALS_TABLE}")
 
-def ai_chatbot_query(user_question):
-    """Enhanced AI chatbot with invoice data context"""
+        return reconcile_df, reconcile_items_full_df, reconcile_totals_full_df
+    except Exception as e:
+        st.error(f"Error loading reconcile data: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+def load_bronze_data(invoice_id):
+    """Loads data from all relevant bronze tables for a specific invoice_id."""
+    bronze_data = {}
     try:
-        # Get system context
-        context_query = f"""
-        SELECT 
-            COUNT(DISTINCT t.invoice_id) as total_invoices,
-            SUM(t.total) as total_amount,
-            AVG(t.total) as avg_amount,
-            MIN(t.invoice_date) as earliest_date,
-            MAX(t.invoice_date) as latest_date,
-            COUNT(DISTINCT CASE WHEN r.review_status = 'Auto-reconciled' THEN t.invoice_id END) as auto_reconciled,
-            COUNT(DISTINCT CASE WHEN r.review_status = 'Pending Review' THEN t.invoice_id END) as pending_review
-        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t
-        LEFT JOIN {DB_NAME}.{SCHEMA_NAME}.RECONCILE_RESULTS_TOTALS r ON t.invoice_id = r.invoice_id
-        """
-        
-        context = conn.query(context_query).iloc[0]
-        
-        # Get recent trends
-        trend_query = f"""
-        SELECT 
-            DATE_TRUNC('month', invoice_date) as month,
-            COUNT(*) as monthly_invoices,
-            SUM(total) as monthly_spend
-        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
-        WHERE invoice_date >= DATEADD(month, -6, CURRENT_DATE())
-        GROUP BY month
-        ORDER BY month DESC
-        LIMIT 3
-        """
-        
-        trends = conn.query(trend_query)
-        trend_summary = []
-        for _, row in trends.iterrows():
-            trend_summary.append(f"{row['MONTH'].strftime('%Y-%m')}: {row['MONTHLY_INVOICES']} invoices, ${row['MONTHLY_SPEND']:,.2f}")
-        
-        prompt = f"""
-        You are an AI assistant for an advanced invoice management system with Document AI and Cortex capabilities.
-        
-        SYSTEM CONTEXT:
-        - Total Invoices: {context['TOTAL_INVOICES']:,}
-        - Total Value: ${context['TOTAL_AMOUNT']:,.2f}
-        - Average Invoice: ${context['AVG_AMOUNT']:,.2f}
-        - Date Range: {context['EARLIEST_DATE']} to {context['LATEST_DATE']}
-        - Auto-reconciled: {context['AUTO_RECONCILED']:,} invoices
-        - Pending Review: {context['PENDING_REVIEW']:,} invoices
-        
-        RECENT TRENDS:
-        {'; '.join(trend_summary)}
-        
-        CAPABILITIES:
-        - Document AI extraction from PDFs
-        - Automated reconciliation with discrepancy detection
-        - Fraud risk analysis using statistical modeling
-        - AI-powered invoice categorization
-        - Anomaly detection and pattern analysis
-        - Real-time Cortex AI insights
-        
-        USER QUESTION: {user_question}
-        
-        Provide a helpful, accurate response. If the question requires specific data analysis, suggest concrete actions or queries that could be performed with the system.
-        """
-        
-        ai_query = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${prompt}$$) as response"
-        ai_result = conn.query(ai_query)
-        return ai_result.iloc[0]['RESPONSE'] if not ai_result.empty else "I apologize, but I'm unable to process your question at the moment."
-        
+        if invoice_id:
+            bronze_data['transact_items'] = conn.query(f"SELECT * FROM {BRONZE_TRANSACT_ITEMS_TABLE} WHERE invoice_id = '{invoice_id}'")
+            bronze_data['transact_totals'] = conn.query(f"SELECT * FROM {BRONZE_TRANSACT_TOTALS_TABLE} WHERE invoice_id = '{invoice_id}'")
+            bronze_data['docai_items'] = conn.query(f"SELECT * FROM {BRONZE_DOCAI_ITEMS_TABLE} WHERE invoice_id = '{invoice_id}'")
+            bronze_data['docai_totals'] = conn.query(f"SELECT * FROM {BRONZE_DOCAI_TOTALS_TABLE} WHERE invoice_id = '{invoice_id}'")
+        return bronze_data
     except Exception as e:
-        return f"I encountered an error while processing your question: {e}"
+        st.error(f"Error loading Bronze data for invoice {invoice_id}: {e}")
+        return {}
 
-def generate_spend_insights():
-    """Generate comprehensive spend analytics using AI"""
-    try:
-        # Get comprehensive spend data
-        analysis_query = f"""
-        WITH monthly_analysis AS (
-            SELECT 
-                DATE_TRUNC('month', invoice_date) as month,
-                COUNT(*) as invoice_count,
-                SUM(total) as monthly_spend,
-                AVG(total) as avg_invoice
-            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
-            WHERE invoice_date >= DATEADD(month, -12, CURRENT_DATE())
-            GROUP BY month
-            ORDER BY month
-        ),
-        category_analysis AS (
-            SELECT 
-                CASE 
-                    WHEN LOWER(product_name) LIKE '%bread%' OR LOWER(product_name) LIKE '%milk%' 
-                         OR LOWER(product_name) LIKE '%eggs%' THEN 'Food & Beverages'
-                    WHEN LOWER(product_name) LIKE '%chicken%' OR LOWER(product_name) LIKE '%cheese%' THEN 'Protein Products'
-                    WHEN LOWER(product_name) LIKE '%rice%' OR LOWER(product_name) LIKE '%onions%' THEN 'Staple Foods'
-                    ELSE 'Other Products'
-                END as category,
-                COUNT(*) as item_count,
-                SUM(total_price) as category_spend,
-                AVG(unit_price) as avg_unit_price
-            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_ITEMS
-            GROUP BY category
-        ),
-        risk_analysis AS (
-            SELECT 
-                COUNT(*) as total_invoices,
-                AVG(total) as overall_avg,
-                STDDEV(total) as overall_stddev,
-                COUNT(CASE WHEN ABS(total - (SELECT AVG(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS)) > 
-                              2 * (SELECT STDDEV(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS) THEN 1 END) as outliers
-            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
-        )
-        SELECT 
-            (SELECT LISTAGG(month || ':$' || monthly_spend, ', ') FROM monthly_analysis) as monthly_trends,
-            (SELECT LISTAGG(category || ':$' || category_spend, ', ') FROM category_analysis) as category_breakdown,
-            (SELECT 'Outliers:' || outliers || '/' || total_invoices FROM risk_analysis) as risk_summary
-        """
-        
-        data = conn.query(analysis_query).iloc[0]
-        
-        prompt = f"""
-        Analyze this comprehensive spend data and provide strategic business insights:
-        
-        MONTHLY TRENDS (Last 12 months):
-        {data['MONTHLY_TRENDS']}
-        
-        CATEGORY BREAKDOWN:
-        {data['CATEGORY_BREAKDOWN']}
-        
-        RISK SUMMARY:
-        {data['RISK_SUMMARY']}
-        
-        Provide 5-7 key insights covering:
-        1. Spending trend analysis (growth, seasonality, patterns)
-        2. Category performance and optimization opportunities
-        3. Risk and anomaly assessment  
-        4. Cost control recommendations
-        5. Process improvement suggestions
-        6. Strategic recommendations
-        
-        Format as numbered insights with specific, actionable recommendations.
-        """
-        
-        ai_query = f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${prompt}$$) as insights"
-        ai_result = conn.query(ai_query)
-        return ai_result.iloc[0]['INSIGHTS'] if not ai_result.empty else "Unable to generate insights at this time."
-        
-    except Exception as e:
-        return f"Error generating insights: {e}"
-
-# --- Enhanced UI Components ---
-
-def render_ai_dashboard():
-    """Render the main AI-powered dashboard"""
-    st.header("🤖 AI-Powered Invoice Intelligence Dashboard")
-    
-    # Key metrics with AI insights
-    col1, col2, col3, col4 = st.columns(4)
-    
-    try:
-        # Get enhanced metrics
-        metrics_query = f"""
-        SELECT 
-            COUNT(DISTINCT t.invoice_id) as total_invoices,
-            SUM(t.total) as total_amount,
-            COUNT(DISTINCT CASE WHEN r.review_status = 'Auto-reconciled' THEN t.invoice_id END) as auto_reconciled,
-            COUNT(DISTINCT CASE WHEN ABS(t.total - (SELECT AVG(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS)) > 
-                                 2 * (SELECT STDDEV(total) FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS) THEN t.invoice_id END) as anomalies
-        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t
-        LEFT JOIN {DB_NAME}.{SCHEMA_NAME}.RECONCILE_RESULTS_TOTALS r ON t.invoice_id = r.invoice_id
-        """
-        
-        metrics = conn.query(metrics_query).iloc[0]
-        
-        col1.metric(
-            "📋 Total Invoices",
-            f"{metrics['TOTAL_INVOICES']:,}",
-            help="Total invoices in the system"
-        )
-        
-        col2.metric(
-            "💰 Total Value", 
-            f"${metrics['TOTAL_AMOUNT']:,.2f}",
-            help="Combined value of all invoices"
-        )
-        
-        auto_rate = (metrics['AUTO_RECONCILED'] / metrics['TOTAL_INVOICES'] * 100) if metrics['TOTAL_INVOICES'] > 0 else 0
-        col3.metric(
-            "🤖 Auto-Reconciled",
-            f"{metrics['AUTO_RECONCILED']:,}",
-            delta=f"{auto_rate:.1f}% of total",
-            help="Invoices automatically reconciled by AI"
-        )
-        
-        col4.metric(
-            "⚠️ Anomalies Detected",
-            f"{metrics['ANOMALIES']:,}",
-            delta="Statistical outliers",
-            help="Invoices with unusual patterns"
-        )
-        
-    except Exception as e:
-        st.error(f"Error loading metrics: {e}")
-
-def render_ai_chatbot():
-    """Enhanced AI chatbot interface"""
-    st.subheader("💬 AI Invoice Assistant")
-    st.caption("Ask me anything about your invoices, patterns, or system capabilities!")
-    
-    # Display recent chat history
-    if st.session_state.chat_history:
-        with st.expander("💭 Recent Conversation", expanded=False):
-            for i, (role, message) in enumerate(st.session_state.chat_history[-6:]):
-                if role == "user":
-                    st.markdown(f"**👤 You:** {message}")
-                else:
-                    st.markdown(f"**🤖 AI:** {message}")
-    
-    # Chat input with suggestions
-    st.markdown("**💡 Try asking:**")
-    suggestion_cols = st.columns(3)
-    
-    suggestions = [
-        "What are my spending trends?",
-        "Show me any suspicious invoices",
-        "How many invoices were auto-reconciled?"
-    ]
-    
-    for i, suggestion in enumerate(suggestions):
-        if suggestion_cols[i].button(f"💭 {suggestion}", key=f"suggest_{i}"):
-            st.session_state.chat_input = suggestion
-    
-    # Main chat input
-    user_input = st.text_input(
-        "Ask your question:",
-        placeholder="e.g., 'What categories am I spending the most on?' or 'Any unusual patterns this month?'",
-        key="chat_input"
-    )
-    
-    if st.button("🚀 Ask AI", type="primary") and user_input:
-        # Add user message
-        st.session_state.chat_history.append(("user", user_input))
-        
-        # Get AI response
-        with st.spinner("🧠 AI is analyzing your invoice data..."):
-            ai_response = ai_chatbot_query(user_input)
-        
-        # Add AI response
-        st.session_state.chat_history.append(("assistant", ai_response))
-        
-        # Show latest response immediately
-        st.markdown("**🤖 AI Assistant:**")
-        st.markdown(ai_response)
-        
-        # Keep only last 20 messages
-        if len(st.session_state.chat_history) > 20:
-            st.session_state.chat_history = st.session_state.chat_history[-20:]
-
-def render_enhanced_invoice_analysis():
-    """Enhanced invoice analysis with AI features"""
-    st.subheader("🔍 Enhanced Invoice Analysis")
-    
-    # Get list of invoices
-    invoice_query = f"""
-    SELECT DISTINCT invoice_id 
-    FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS 
-    ORDER BY invoice_id
+def get_invoice_reconciliation_metrics():
+    """Get reconciliation metrics from the database."""
+    sql_query = f"""
+    SELECT
+        COUNT(DISTINCT tt.invoice_id) AS total_invoice_count,
+        SUM(tt.total) AS grand_total_amount,
+        COUNT(DISTINCT CASE
+                        WHEN EXISTS (SELECT 1 FROM {GOLD_TOTALS_TABLE} git WHERE git.invoice_id = tt.invoice_id)
+                         AND EXISTS (SELECT 1 FROM {GOLD_ITEMS_TABLE} gii WHERE gii.invoice_id = tt.invoice_id)
+                        THEN tt.invoice_id
+                        ELSE NULL
+                    END) AS reconciled_invoice_count,
+        COUNT(DISTINCT CASE
+                        WHEN EXISTS (SELECT 1 FROM {GOLD_TOTALS_TABLE} git WHERE git.invoice_id = tt.invoice_id AND git.reviewed_by = 'Auto-reconciled')
+                         AND EXISTS (SELECT 1 FROM {GOLD_ITEMS_TABLE} gii WHERE gii.invoice_id = tt.invoice_id AND gii.reviewed_by = 'Auto-reconciled')
+                        THEN tt.invoice_id
+                        ELSE NULL
+                    END) AS auto_reconciled_invoice_count,
+        SUM(CASE
+                WHEN EXISTS (SELECT 1 FROM {GOLD_TOTALS_TABLE} git WHERE git.invoice_id = tt.invoice_id)
+                 AND EXISTS (SELECT 1 FROM {GOLD_ITEMS_TABLE} gii WHERE gii.invoice_id = tt.invoice_id)
+                THEN tt.total
+                ELSE 0
+            END) AS total_reconciled_amount
+    FROM {BRONZE_TRANSACT_TOTALS_TABLE} AS tt
     """
     
     try:
-        invoices_df = conn.query(invoice_query)
-        invoice_list = [""] + invoices_df['INVOICE_ID'].tolist()
+        result = conn.query(sql_query)
+        if not result.empty:
+            row = result.iloc[0]
+            
+            total_invoices = row['TOTAL_INVOICE_COUNT'] or 0
+            grand_total = row['GRAND_TOTAL_AMOUNT'] or 0.0
+            reconciled_invoices = row['RECONCILED_INVOICE_COUNT'] or 0
+            total_reconciled = row['TOTAL_RECONCILED_AMOUNT'] or 0.0
+            count_auto_reconciled = row['AUTO_RECONCILED_INVOICE_COUNT'] or 0
+            
+            reconciled_invoice_ratio = (float(reconciled_invoices) / float(total_invoices)) if total_invoices > 0 else 0.0
+            reconciled_amount_ratio = (float(total_reconciled) / float(grand_total)) if grand_total != 0 else 0.0
+            
+            return {
+                'total_invoice_count': int(total_invoices),
+                'grand_total_amount': float(grand_total),
+                'reconciled_invoice_count': int(reconciled_invoices),
+                'total_reconciled_amount': float(total_reconciled),
+                'reconciled_invoice_ratio': float(reconciled_invoice_ratio),
+                'reconciled_amount_ratio': float(reconciled_amount_ratio),
+                'count_auto_reconciled': int(count_auto_reconciled)
+            }
+    except Exception as e:
+        st.error(f"Error getting reconciliation metrics: {e}")
+        return None
+
+def summarize_mismatch_details(reconcile_items_details_df, reconcile_totals_details_df, selected_invoice_id):
+    """Summarizes item mismatch details using Snowflake Cortex."""
+    try:
+        # Filter DataFrames for the selected invoice ID
+        try:
+            item_mismatch_details = reconcile_items_details_df[reconcile_items_details_df["INVOICE_ID"] == selected_invoice_id]["ITEM_MISMATCH_DETAILS"].iloc[0]
+        except:
+            item_mismatch_details = ""
         
-        selected_invoice_id = st.selectbox("Select Invoice for AI Analysis:", invoice_list, index=0)
+        try:
+            total_mismatch_details = reconcile_totals_details_df[reconcile_totals_details_df["INVOICE_ID"] == selected_invoice_id]["ITEM_MISMATCH_DETAILS"].iloc[0]
+        except:
+            total_mismatch_details = ""
+
+        all_mismatch_details = str(item_mismatch_details) + str(total_mismatch_details)
+
+        if not all_mismatch_details or all_mismatch_details == "":
+            return f"No item mismatch details found for Invoice ID: {selected_invoice_id}."
+
+        # Construct the prompt for Snowflake Cortex
+        prompt = f"""
+        Based on the following item mismatch details for invoice {selected_invoice_id}, please provide a concise summary of the differences.
+        Focus on the types of mismatches and affected items or amounts, do not use the words expected or actual.
+
+        Mismatch Details:
+        ---
+        {all_mismatch_details}
+        ---
+        """
+
+        # Call Cortex complete function
+        try:
+            response = conn.query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-70b', $${prompt}$$) as summary")
+            summary = response.iloc[0]["SUMMARY"] if not response.empty else "Could not retrieve summary."
+        except Exception as e:
+            return f"Error calling Snowflake Cortex: {e}"
+
+        return summary
+
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
+        return f"Failed to generate summary due to an error: {str(e)}"
+
+# --- Enhanced Functions from previous version ---
+@st.cache_data(ttl=300)
+def get_invoice_metrics():
+    """Get basic invoice metrics"""
+    try:
+        query = f"""
+        SELECT 
+            COUNT(DISTINCT invoice_id) as total_invoices,
+            SUM(total) as total_amount,
+            AVG(total) as avg_amount,
+            MIN(invoice_date) as earliest_date,
+            MAX(invoice_date) as latest_date
+        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
+        """
+        return conn.query(query).iloc[0].to_dict()
+    except Exception as e:
+        st.error(f"Error getting metrics: {e}")
+        return {}
+
+def ai_fraud_analysis(invoice_id):
+    """AI-powered fraud analysis"""
+    try:
+        query = f"""
+        WITH stats AS (
+            SELECT 
+                AVG(total) as avg_total,
+                STDDEV(total) as stddev_total
+            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
+        ),
+        invoice_data AS (
+            SELECT 
+                invoice_id,
+                total,
+                invoice_date,
+                (total - stats.avg_total) / stats.stddev_total as z_score
+            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS, stats
+            WHERE invoice_id = '{invoice_id}'
+        )
+        SELECT 
+            SNOWFLAKE.CORTEX.COMPLETE(
+                'llama3.1-8b',
+                'Analyze this invoice for fraud risk: ID=' || invoice_id || 
+                ', Amount=$' || total || ', Date=' || invoice_date || 
+                ', Z-score=' || z_score || 
+                '. Provide risk assessment and reasoning in 2-3 sentences.'
+            ) as analysis
+        FROM invoice_data
+        """
+        result = conn.query(query)
+        return result.iloc[0]['ANALYSIS'] if not result.empty else "Analysis not available"
+    except Exception as e:
+        return f"Error in fraud analysis: {e}"
+
+def ai_categorize_invoice(invoice_id):
+    """AI-powered invoice categorization"""
+    try:
+        query = f"""
+        WITH invoice_details AS (
+            SELECT 
+                t.invoice_id,
+                t.total,
+                LISTAGG(ti.product_name, ', ') as products
+            FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t
+            LEFT JOIN {DB_NAME}.{SCHEMA_NAME}.TRANSACT_ITEMS ti ON t.invoice_id = ti.invoice_id
+            WHERE t.invoice_id = '{invoice_id}'
+            GROUP BY t.invoice_id, t.total
+        )
+        SELECT 
+            SNOWFLAKE.CORTEX.COMPLETE(
+                'llama3.1-8b',
+                'Categorize this invoice based on products: ' || products || 
+                '. Amount: $' || total || 
+                '. Provide category (e.g., Office Supplies, Food, Technology) and brief explanation.'
+            ) as category
+        FROM invoice_details
+        """
+        result = conn.query(query)
+        return result.iloc[0]['CATEGORY'] if not result.empty else "Category not available"
+    except Exception as e:
+        return f"Error in categorization: {e}"
+
+def ai_assistant_query(user_question):
+    """AI assistant for answering questions about invoice data"""
+    try:
+        # Get basic context about the data
+        context_query = f"""
+        SELECT 
+            COUNT(*) as total_invoices,
+            SUM(total) as total_amount,
+            AVG(total) as avg_amount,
+            MIN(invoice_date) as earliest_date,
+            MAX(invoice_date) as latest_date
+        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
+        """
+        context = conn.query(context_query).iloc[0]
         
-        if selected_invoice_id:
+        prompt = f"""
+        You are an AI assistant helping with invoice analysis. Here's the current data context:
+        - Total invoices: {context['TOTAL_INVOICES']}
+        - Total amount: ${context['TOTAL_AMOUNT']:,.2f}
+        - Average amount: ${context['AVG_AMOUNT']:,.2f}
+        - Date range: {context['EARLIEST_DATE']} to {context['LATEST_DATE']}
+        
+        User question: {user_question}
+        
+        Provide a helpful response based on this invoice data. If you need specific data to answer, suggest what analysis could be done.
+        """
+        
+        query = f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', $${prompt}$$) as response
+        """
+        result = conn.query(query)
+        return result.iloc[0]['RESPONSE'] if not result.empty else "I couldn't process your question."
+    except Exception as e:
+        return f"Error processing question: {e}"
+
+# --- UI Functions ---
+def show_dashboard():
+    """Show main dashboard"""
+    st.header("🏠 AI Invoice Intelligence Dashboard")
+    
+    # Get metrics
+    metrics = get_invoice_metrics()
+    reconciliation_metrics = get_invoice_reconciliation_metrics()
+    
+    if metrics:
+        # Main metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Invoices", f"{metrics.get('TOTAL_INVOICES', 0):,}")
+        with col2:
+            st.metric("Total Amount", f"${metrics.get('TOTAL_AMOUNT', 0):,.2f}")
+        with col3:
+            st.metric("Average Amount", f"${metrics.get('AVG_AMOUNT', 0):,.2f}")
+        with col4:
+            if reconciliation_metrics:
+                st.metric("Auto-Reconciled", f"{reconciliation_metrics.get('count_auto_reconciled', 0)}")
+    
+    # Reconciliation metrics
+    if reconciliation_metrics:
+        st.subheader("📊 Reconciliation Status")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric(
+                "Reconciled Invoices", 
+                f"{reconciliation_metrics['reconciled_invoice_ratio']:.1%}",
+                delta=f"{reconciliation_metrics['reconciled_invoice_count']}/{reconciliation_metrics['total_invoice_count']}"
+            )
+        with col2:
+            st.metric(
+                "Reconciled Amount", 
+                f"{reconciliation_metrics['reconciled_amount_ratio']:.1%}",
+                delta=f"${reconciliation_metrics['total_reconciled_amount']:,.0f}/${reconciliation_metrics['grand_total_amount']:,.0f}"
+            )
+    
+    # System status
+    st.subheader("⚙️ System Status")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.success("✅ Streamlit in Snowflake")
+    with col2:
+        st.success("✅ Document AI Active")
+    with col3:
+        try:
+            conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', 'test')")
+            st.success("✅ Cortex AI Ready")
+        except:
+            st.warning("⚠️ Cortex AI Limited")
+
+def show_reconciliation():
+    """Show invoice reconciliation interface"""
+    st.header("🔍 Invoice Reconciliation")
+    
+    # Get reconciliation metrics
+    with st.spinner("Loading reconciliation metrics..."):
+        reconciliation_data = get_invoice_reconciliation_metrics()
+    
+    if reconciliation_data:
+        st.success("Metrics displayed below (updated automatically).")
+        st.success(f"{reconciliation_data['count_auto_reconciled']} Invoices out of {reconciliation_data['total_invoice_count']} were fully Auto-Reconciled with DocAI")
+        
+        st.subheader("Reconciliation Ratios")
+        col1, col2 = st.columns(2)
+        col1.metric(
+            label="Reconciled Invoices (Count Ratio)",
+            value=f"{reconciliation_data['reconciled_invoice_ratio']:.2%}",
+            help=f"Percentage of unique invoices from TRANSACT_TOTALS found in both GOLD tables. ({reconciliation_data['reconciled_invoice_count']}/{reconciliation_data['total_invoice_count']})"
+        )
+        col2.metric(
+            label="Reconciled Amount (Value Ratio)",
+            value=f"{reconciliation_data['reconciled_amount_ratio']:.2%}",
+            help=f"Percentage of total amount from TRANSACT_TOTALS that corresponds to reconciled invoices. (${reconciliation_data['total_reconciled_amount']:,.2f} / ${reconciliation_data['grand_total_amount']:,.2f})"
+        )
+
+        st.subheader("Detailed Numbers")
+        df_metrics = pd.DataFrame([
+             {"Metric": "Total Unique Invoices", "Value": reconciliation_data['total_invoice_count']},
+             {"Metric": "Fully Reconciled Invoices", "Value": reconciliation_data['reconciled_invoice_count']},
+             {"Metric": "Grand Total Amount ($)", "Value": f"{reconciliation_data['grand_total_amount']:,.2f}"},
+             {"Metric": "Total Reconciled Amount ($)", "Value": f"{reconciliation_data['total_reconciled_amount']:,.2f}"},
+        ]).set_index("Metric")
+        st.dataframe(df_metrics)
+    else:
+        st.warning("Could not retrieve or calculate reconciliation metrics.")
+
+    # Section 1: Display reconcile Tables & Select Invoice
+    st.header("1. Invoices Awaiting Review")
+
+    review_status_options = ['Pending Review', 'Reviewed', 'Auto-reconciled']
+    selected_status = st.selectbox("Filter by Review Status:", review_status_options, index=0)
+
+    # Load distinct invoice IDs based on filter
+    invoices_to_review_df, reconcile_items_details_df, reconcile_totals_details_df = load_reconcile_data(selected_status)
+
+    if not invoices_to_review_df.empty:
+        st.write(f"Found {len(invoices_to_review_df['INVOICE_ID'].unique())} unique invoices with totals or items status '{selected_status}'.")
+
+        # Allow user to select an invoice
+        invoice_list = [""] + invoices_to_review_df['INVOICE_ID'].unique().tolist()
+        selected_invoice_id = st.selectbox(
+            "Select Invoice ID to Review/Correct:",
+            invoice_list,
+            index=0,
+            key="invoice_selector"
+        )
+
+        # Display details from reconcile tables for context
+        with st.expander("Show Reconciliation Details for All Filtered Invoices"):
+             st.subheader("Item Reconciliation Details")
+             st.dataframe(reconcile_items_details_df, use_container_width=True)
+             st.subheader("Total Reconciliation Details")
+             st.dataframe(reconcile_totals_details_df, use_container_width=True)
+
+    else:
+        st.info(f"No invoices found with status '{selected_status}'.")
+        selected_invoice_id = None
+
+    # Section 2: Display Bronze Data for Selected Invoice
+    st.header("2. Review and Correct Invoice Data")
+
+    if selected_invoice_id:
+        st.subheader(f"Displaying Data for Invoice: `{selected_invoice_id}`")
+        
+        # Generate mismatch summary
+        if selected_invoice_id != st.session_state.processed_invoice_id:
+            mismatch_summary = summarize_mismatch_details(reconcile_items_details_df, reconcile_totals_details_df, selected_invoice_id)
+            st.session_state.cached_mismatch_summary = mismatch_summary
+            st.session_state.processed_invoice_id = selected_invoice_id
+        
+        if st.session_state.cached_mismatch_summary is not None:
+            st.subheader(f"{st.session_state.cached_mismatch_summary}")
+        
+        # Load data from Bronze layer
+        bronze_data_dict = load_bronze_data(selected_invoice_id)
+
+        if bronze_data_dict:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**Original Data (Source: TRANSACT_*)**")
+                st.markdown(":rainbow[Editable Fields] - These can be edited directly and then accepted in section 3.")
+
+                # Editable Transact Items
+                st.write("**Items (Original DB):**")
+                if not bronze_data_dict['transact_items'].empty:
+                     # Convert relevant columns to numeric for proper editing
+                     for col_name in ['QUANTITY', 'UNIT_PRICE', 'TOTAL_PRICE']:
+                        if col_name in bronze_data_dict['transact_items'].columns:
+                            bronze_data_dict['transact_items'][col_name] = pd.to_numeric(bronze_data_dict['transact_items'][col_name], errors='coerce')
+
+                     edited_transact_items_df = st.data_editor(
+                        bronze_data_dict['transact_items'],
+                        key="editor_transact_items",
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        column_config={
+                            "UNIT_PRICE": st.column_config.NumberColumn(format="$%.2f"),
+                            "TOTAL_PRICE": st.column_config.NumberColumn(format="$%.2f"),
+                        }
+                    )
+                     st.session_state.edited_transact_items = edited_transact_items_df
+                else:
+                     st.info("No data found in TRANSACT_ITEMS for this invoice.")
+
+                # Editable Transact Totals
+                st.write("**Totals (Original DB):**")
+                if not bronze_data_dict['transact_totals'].empty:
+                    transact_totals_edit_df = bronze_data_dict['transact_totals'].head(1).copy()
+
+                    # Convert relevant columns to numeric/date
+                    for col_name in ['SUBTOTAL', 'TAX', 'TOTAL']:
+                         if col_name in transact_totals_edit_df.columns:
+                            transact_totals_edit_df[col_name] = pd.to_numeric(transact_totals_edit_df[col_name], errors='coerce')
+                    if 'INVOICE_DATE' in transact_totals_edit_df.columns:
+                        transact_totals_edit_df['INVOICE_DATE'] = pd.to_datetime(transact_totals_edit_df['INVOICE_DATE'], errors='coerce').dt.date
+
+                    edited_transact_totals_df = st.data_editor(
+                        transact_totals_edit_df,
+                        key="editor_transact_totals",
+                        use_container_width=True,
+                        column_config={
+                            "SUBTOTAL": st.column_config.NumberColumn(format="$%.2f"),
+                            "TAX": st.column_config.NumberColumn(format="$%.2f"),
+                            "TOTAL": st.column_config.NumberColumn(format="$%.2f"),
+                            "INVOICE_DATE": st.column_config.DateColumn(),
+                        }
+                    )
+                    st.session_state.edited_transact_totals = edited_transact_totals_df
+                else:
+                    st.info("No data found in TRANSACT_TOTALS for this invoice.")
+
+            with col2:
+                st.markdown("**Document AI Extracted Data**")
+                st.markdown("Reference data extracted by Document AI")
+
+                # DocAI Items (Read-only)
+                st.write("**Items (DocAI Extracted):**")
+                if not bronze_data_dict['docai_items'].empty:
+                    st.dataframe(bronze_data_dict['docai_items'], use_container_width=True)
+                    st.session_state.docai_items = bronze_data_dict['docai_items']
+                else:
+                    st.info("No DocAI items data found for this invoice.")
+
+                # DocAI Totals (Read-only)
+                st.write("**Totals (DocAI Extracted):**")
+                if not bronze_data_dict['docai_totals'].empty:
+                    st.dataframe(bronze_data_dict['docai_totals'], use_container_width=True)
+                    st.session_state.docai_totals = bronze_data_dict['docai_totals']
+                else:
+                    st.info("No DocAI totals data found for this invoice.")
+
+        # Section 3: Submit Corrections
+        st.header("3. Submit Review and Corrections")
+        
+        submit_docai_button = st.button("❄️ ✅ Accept DocAI Extracted Values for Reconciliation")
+        
+        st.write("Or...")
+        
+        # Add fields for notes and corrected invoice number
+        review_notes = st.text_area("Manual Review Notes / Comments:", key="review_notes")
+
+        submit_button = st.button("✍️ ✔️ Accept Manual Edits above for Reconciliation")
+
+        if submit_button or submit_docai_button:
+            # Data Validation
+            valid = True
+            if submit_docai_button:
+                if 'docai_items' not in st.session_state or st.session_state.docai_items.empty:
+                    st.warning("No item data to submit.")
+                    valid = False
+                elif 'docai_totals' not in st.session_state or st.session_state.docai_totals.empty:
+                    st.warning("No total data to submit.")
+                    valid = False
+                else:
+                    gold_items_df = st.session_state.docai_items[["INVOICE_ID", "PRODUCT_NAME", "QUANTITY", "UNIT_PRICE", "TOTAL_PRICE"]].copy()
+                    gold_totals_df = st.session_state.docai_totals[["INVOICE_ID", "INVOICE_DATE", "SUBTOTAL", "TAX", "TOTAL"]].copy()
+                
+            else:
+                if 'edited_transact_items' not in st.session_state or st.session_state.edited_transact_items.empty:
+                    st.warning("No item data to submit.")
+                    valid = False
+                elif 'edited_transact_totals' not in st.session_state or st.session_state.edited_transact_totals.empty:
+                    st.warning("No total data to submit.")
+                    valid = False
+                else:
+                    gold_items_df = st.session_state.edited_transact_items.copy()
+                    gold_totals_df = st.session_state.edited_transact_totals.copy()
+
+            if valid:
+                try:
+                    st.write("Submitting...")
+                    current_ts = datetime.now()
+
+                    # Prepare Data for Gold Layer
+                    # Items
+                    gold_items_df['INVOICE_ID'] = selected_invoice_id
+                    gold_items_df['REVIEWED_BY'] = CURRENT_USER
+                    gold_items_df['REVIEWED_TIMESTAMP'] = current_ts
+                    gold_items_df['NOTES'] = review_notes
+
+                    # Insert items data
+                    st.write(f"Writing {len(gold_items_df)} rows to {GOLD_ITEMS_TABLE}...")
+                    
+                    # Delete existing before insert
+                    conn.query(f"DELETE FROM {GOLD_ITEMS_TABLE} WHERE INVOICE_ID = '{selected_invoice_id}'")
+                    
+                    # Insert new data (using a more SiS-compatible approach)
+                    for _, row in gold_items_df.iterrows():
+                        insert_query = f"""
+                        INSERT INTO {GOLD_ITEMS_TABLE} 
+                        (INVOICE_ID, PRODUCT_NAME, QUANTITY, UNIT_PRICE, TOTAL_PRICE, REVIEWED_BY, REVIEWED_TIMESTAMP, NOTES)
+                        VALUES ('{row['INVOICE_ID']}', '{str(row['PRODUCT_NAME']).replace("'", "''")}', 
+                               {row['QUANTITY']}, {row['UNIT_PRICE']}, {row['TOTAL_PRICE']}, 
+                               '{CURRENT_USER}', '{current_ts.strftime('%Y-%m-%d %H:%M:%S')}', 
+                               '{str(review_notes).replace("'", "''")}')
+                        """
+                        conn.query(insert_query)
+                    
+                    st.success(f"Successfully saved corrected items to {GOLD_ITEMS_TABLE}")
+
+                    # Totals
+                    gold_totals_df['INVOICE_ID'] = selected_invoice_id
+                    gold_totals_df['REVIEWED_BY'] = CURRENT_USER
+                    gold_totals_df['REVIEWED_TIMESTAMP'] = current_ts
+                    gold_totals_df['NOTES'] = review_notes
+
+                    st.write(f"Writing corrected totals to {GOLD_TOTALS_TABLE}...")
+                    
+                    # Delete existing before insert
+                    conn.query(f"DELETE FROM {GOLD_TOTALS_TABLE} WHERE INVOICE_ID = '{selected_invoice_id}'")
+                    
+                    # Insert totals data
+                    for _, row in gold_totals_df.iterrows():
+                        insert_query = f"""
+                        INSERT INTO {GOLD_TOTALS_TABLE} 
+                        (INVOICE_ID, INVOICE_DATE, SUBTOTAL, TAX, TOTAL, REVIEWED_BY, REVIEWED_TIMESTAMP, NOTES)
+                        VALUES ('{row['INVOICE_ID']}', '{row['INVOICE_DATE']}', 
+                               {row['SUBTOTAL']}, {row['TAX']}, {row['TOTAL']}, 
+                               '{CURRENT_USER}', '{current_ts.strftime('%Y-%m-%d %H:%M:%S')}', 
+                               '{str(review_notes).replace("'", "''")}')
+                        """
+                        conn.query(insert_query)
+                    
+                    st.success(f"Successfully saved corrected totals to {GOLD_TOTALS_TABLE}")
+
+                    # Update reconcile Tables Review Status
+                    st.write("Updating review status in reconcile tables...")
+                    
+                    update_query = f"""
+                    UPDATE {RECONCILE_ITEMS_TABLE}
+                    SET REVIEW_STATUS = 'Reviewed',
+                        REVIEWED_BY = '{CURRENT_USER}',
+                        REVIEWED_TIMESTAMP = '{current_ts.strftime('%Y-%m-%d %H:%M:%S')}',
+                        NOTES = '{str(review_notes).replace("'", "''")}'
+                    WHERE INVOICE_ID = '{selected_invoice_id}'
+                    """
+                    conn.query(update_query)
+
+                    update_query = f"""
+                    UPDATE {RECONCILE_TOTALS_TABLE}
+                    SET REVIEW_STATUS = 'Reviewed',
+                        REVIEWED_BY = '{CURRENT_USER}',
+                        REVIEWED_TIMESTAMP = '{current_ts.strftime('%Y-%m-%d %H:%M:%S')}',
+                        NOTES = '{str(review_notes).replace("'", "''")}'
+                    WHERE INVOICE_ID = '{selected_invoice_id}'
+                    """
+                    conn.query(update_query)
+
+                    st.success(f"Successfully updated review status for invoice {selected_invoice_id} in reconcile tables.")
+
+                    # Clear Cache and Rerun
+                    st.cache_data.clear()
+                    st.info("Refreshing application...")
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"An error occurred during submission: {e}")
+
+    else:
+        st.warning("Please select an invoice ID from the dropdown above.")
+
+def show_ai_analysis():
+    """AI analysis interface"""
+    st.header("🔍 AI Invoice Analysis")
+    
+    # Get invoice list
+    try:
+        invoice_query = f"SELECT DISTINCT invoice_id FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS ORDER BY invoice_id"
+        invoices = conn.query(invoice_query)['INVOICE_ID'].tolist()
+        
+        selected_invoice = st.selectbox("Select Invoice:", [""] + invoices)
+        
+        if selected_invoice:
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("**🚨 Fraud Risk Analysis**")
-                if st.button("🔍 Analyze Fraud Risk", key="fraud_btn"):
-                    with st.spinner("AI is analyzing fraud patterns..."):
-                        fraud_result = ai_fraud_risk_analysis(selected_invoice_id)
-                    
-                    # Display results with color coding
-                    risk_color = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(fraud_result["risk_level"], "⚪")
-                    st.markdown(f"**Risk Level:** {risk_color} {fraud_result['risk_level']}")
-                    st.markdown(f"**Risk Score:** {fraud_result.get('risk_score', 0):.2f}/1.0")
-                    
-                    if 'z_score' in fraud_result:
-                        st.markdown(f"**Statistical Z-Score:** {fraud_result['z_score']:.2f}")
-                    
-                    st.markdown("**AI Analysis:**")
-                    st.write(fraud_result["analysis"])
+                st.subheader("🚨 Fraud Risk Analysis")
+                if st.button("Analyze Fraud Risk"):
+                    with st.spinner("AI analyzing..."):
+                        analysis = ai_fraud_analysis(selected_invoice)
+                    st.write(analysis)
             
             with col2:
-                st.markdown("**🏷️ AI Categorization**")
-                if st.button("🎯 Categorize Invoice", key="category_btn"):
-                    with st.spinner("AI is categorizing invoice..."):
-                        category_result = ai_invoice_categorization(selected_invoice_id)
-                    
-                    st.markdown(f"**Category:** {category_result['category']}")
-                    st.markdown(f"**Confidence:** {category_result['confidence']:.1%}")
-                    st.markdown("**Reasoning:**")
-                    st.write(category_result["reasoning"])
+                st.subheader("🏷️ Invoice Categorization")
+                if st.button("Categorize Invoice"):
+                    with st.spinner("AI categorizing..."):
+                        category = ai_categorize_invoice(selected_invoice)
+                    st.write(category)
                     
     except Exception as e:
         st.error(f"Error loading invoices: {e}")
 
-def render_spend_analytics():
-    """Enhanced spend analytics with AI insights"""
-    st.header("📊 AI-Powered Spend Analytics")
+def show_ai_assistant():
+    """AI assistant chat interface"""
+    st.header("💬 AI Assistant")
+    st.write("Ask questions about your invoice data!")
     
-    tab1, tab2, tab3 = st.tabs(["📈 Trends & Insights", "🔍 Anomaly Detection", "💡 AI Recommendations"])
+    # Display chat history
+    for i, (question, answer) in enumerate(st.session_state.chat_history):
+        with st.chat_message("user"):
+            st.write(question)
+        with st.chat_message("assistant"):
+            st.write(answer)
     
-    with tab1:
-        col1, col2 = st.columns([3, 1])
+    # Chat input
+    if prompt := st.chat_input("Ask about your invoices..."):
+        # Add user message to chat history
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Get AI response
+        with st.chat_message("assistant"):
+            with st.spinner("AI thinking..."):
+                response = ai_assistant_query(prompt)
+            st.write(response)
+        
+        # Save to chat history
+        st.session_state.chat_history.append((prompt, response))
+
+def show_analytics():
+    """Show analytics dashboard"""
+    st.header("📊 Analytics Dashboard")
+    
+    try:
+        # Monthly spend trends
+        monthly_query = f"""
+        SELECT 
+            DATE_TRUNC('month', invoice_date) as month,
+            SUM(total) as monthly_total,
+            COUNT(*) as invoice_count
+        FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
+        WHERE invoice_date IS NOT NULL
+        GROUP BY DATE_TRUNC('month', invoice_date)
+        ORDER BY month
+        """
+        monthly_data = conn.query(monthly_query)
+        
+        if not monthly_data.empty:
+            fig = px.line(monthly_data, x='MONTH', y='MONTHLY_TOTAL', 
+                         title='Monthly Spend Trends',
+                         labels={'MONTHLY_TOTAL': 'Total Amount ($)', 'MONTH': 'Month'})
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Top spending categories (if you have category data)
+        col1, col2 = st.columns(2)
         
         with col1:
-            # Create spend trend visualization
-            try:
-                trend_query = f"""
+            st.subheader("📈 Invoice Distribution")
+            amount_ranges = conn.query(f"""
                 SELECT 
-                    DATE_TRUNC('month', invoice_date) as month,
-                    COUNT(*) as invoice_count,
-                    SUM(total) as total_spend,
-                    AVG(total) as avg_invoice
+                    CASE 
+                        WHEN total < 100 THEN 'Under $100'
+                        WHEN total < 500 THEN '$100-$500'
+                        WHEN total < 1000 THEN '$500-$1000'
+                        ELSE 'Over $1000'
+                    END as amount_range,
+                    COUNT(*) as count
                 FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
-                WHERE invoice_date >= DATEADD(month, -12, CURRENT_DATE())
-                GROUP BY month
-                ORDER BY month
-                """
-                
-                trend_data = conn.query(trend_query)
-                
-                if not trend_data.empty:
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    
-                    fig.add_trace(
-                        go.Scatter(x=trend_data['MONTH'], y=trend_data['TOTAL_SPEND'],
-                                 mode='lines+markers', name='Total Spend ($)',
-                                 line=dict(color='#1f77b4', width=3)),
-                    )
-                    
-                    fig.add_trace(
-                        go.Bar(x=trend_data['MONTH'], y=trend_data['INVOICE_COUNT'],
-                               name='Invoice Count', opacity=0.7,
-                               marker_color='#ff7f0e'),
-                        secondary_y=True
-                    )
-                    
-                    fig.update_layout(
-                        title="📈 Monthly Spend Trends",
-                        height=400,
-                        hovermode='x'
-                    )
-                    
-                    fig.update_yaxes(title_text="Total Spend ($)", secondary_y=False)
-                    fig.update_yaxes(title_text="Invoice Count", secondary_y=True)
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                
-            except Exception as e:
-                st.error(f"Error creating trend visualization: {e}")
+                GROUP BY amount_range
+                ORDER BY count DESC
+            """)
+            
+            if not amount_ranges.empty:
+                fig = px.pie(amount_ranges, values='COUNT', names='AMOUNT_RANGE', 
+                           title='Invoice Amount Distribution')
+                st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.markdown("**📊 Quick Stats**")
-            
-            if st.button("🧠 Generate AI Insights"):
-                with st.spinner("AI is analyzing spend patterns..."):
-                    insights = generate_spend_insights()
+            st.subheader("🎯 Key Metrics")
+            metrics = get_invoice_metrics()
+            if metrics:
+                st.metric("Total Invoices", f"{metrics.get('TOTAL_INVOICES', 0):,}")
+                st.metric("Total Value", f"${metrics.get('TOTAL_AMOUNT', 0):,.2f}")
+                st.metric("Average Invoice", f"${metrics.get('AVG_AMOUNT', 0):,.2f}")
                 
-                st.markdown("**💡 AI Insights:**")
-                st.write(insights)
-    
-    with tab2:
-        st.subheader("🔍 Statistical Anomaly Detection")
+                if metrics.get('EARLIEST_DATE') and metrics.get('LATEST_DATE'):
+                    date_range = pd.to_datetime(metrics['LATEST_DATE']) - pd.to_datetime(metrics['EARLIEST_DATE'])
+                    st.metric("Date Range", f"{date_range.days} days")
         
-        if st.button("🚨 Detect Anomalies"):
-            try:
-                anomaly_query = f"""
-                WITH stats AS (
-                    SELECT AVG(total) as avg_total, STDDEV(total) as stddev_total
-                    FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS
-                ),
-                outliers AS (
-                    SELECT 
-                        t.invoice_id,
-                        t.total,
-                        t.invoice_date,
-                        s.avg_total,
-                        (t.total - s.avg_total) / s.stddev_total as z_score
-                    FROM {DB_NAME}.{SCHEMA_NAME}.TRANSACT_TOTALS t
-                    CROSS JOIN stats s
-                    WHERE ABS((t.total - s.avg_total) / s.stddev_total) > 2
-                    ORDER BY ABS(z_score) DESC
-                )
-                SELECT * FROM outliers LIMIT 10
-                """
-                
-                anomalies = conn.query(anomaly_query)
-                
-                if not anomalies.empty:
-                    st.markdown("**⚠️ Statistical Outliers Found:**")
-                    
-                    for _, row in anomalies.iterrows():
-                        severity = "🔴 Critical" if abs(row['Z_SCORE']) > 3 else "🟡 Medium"
-                        
-                        with st.expander(f"{severity} - Invoice {row['INVOICE_ID']} (Z-score: {row['Z_SCORE']:.2f})"):
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("Amount", f"${row['TOTAL']:,.2f}")
-                            col2.metric("Expected Avg", f"${row['AVG_TOTAL']:,.2f}")
-                            col3.metric("Deviation", f"{abs(row['Z_SCORE']):.1f}σ")
-                            
-                            st.write(f"**Date:** {row['INVOICE_DATE']}")
-                else:
-                    st.success("✅ No statistical anomalies detected!")
-                    
-            except Exception as e:
-                st.error(f"Error detecting anomalies: {e}")
-    
-    with tab3:
-        st.subheader("💡 AI-Powered Recommendations")
-        st.info("This section provides AI-generated recommendations for process improvements and cost optimization.")
-        
-        if st.button("🎯 Get AI Recommendations"):
-            with st.spinner("AI is generating recommendations..."):
-                recommendations = generate_spend_insights()
-            
-            st.markdown("**🚀 Strategic Recommendations:**")
-            st.write(recommendations)
+    except Exception as e:
+        st.error(f"Error loading analytics: {e}")
 
 # --- Main Application ---
 
-def main():
-    # Enhanced CSS styling
-    st.markdown("""
+# Enhanced CSS styling
+st.markdown("""
     <style>
     .main-header {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -681,64 +811,49 @@ def main():
     }
     </style>
     """, unsafe_allow_html=True)
-    
-    # Enhanced header
-    st.markdown("""
+
+# Enhanced header
+st.markdown("""
     <div class="main-header">
         <h1>🚀 Enhanced Invoice Intelligence Platform</h1>
         <p>Powered by Snowflake Cortex AI + Document AI + Advanced Analytics</p>
         <p><em>Running in Streamlit in Snowflake (SiS)</em></p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Sidebar navigation
-    with st.sidebar:
-        st.markdown("### 🎛️ Navigation")
-        
-        page = st.selectbox("Choose Module:", [
-            "🏠 AI Dashboard",
-            "🔍 Enhanced Invoice Analysis", 
-            "💬 AI Assistant",
-            "📊 Advanced Analytics"
-        ])
-        
-        st.divider()
-        
-        # System info
-        st.markdown("### ℹ️ System Info")
-        st.info("🚀 Running on Streamlit in Snowflake")
-        st.success("✅ Cortex AI Enabled")
-        st.success("✅ Document AI Ready")
-    
-    # Route to different pages
-    if page == "🏠 AI Dashboard":
-        render_ai_dashboard()
-        
-        st.divider()
-        
-        # Quick action buttons
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.markdown("**🔍 Invoice Analysis**")
-            st.caption("AI-powered fraud detection and categorization")
-        
-        with col2:
-            st.markdown("**💬 AI Assistant**")
-            st.caption("Natural language invoice queries")
-        
-        with col3:
-            st.markdown("**📊 Analytics**")
-            st.caption("Interactive visualizations and insights")
-    
-    elif page == "💬 AI Assistant":
-        render_ai_chatbot()
-    
-    elif page == "🔍 Enhanced Invoice Analysis":
-        render_enhanced_invoice_analysis()
-    
-    elif page == "📊 Advanced Analytics":
-        render_spend_analytics()
 
-if __name__ == "__main__":
-    main() 
+# Sidebar navigation
+with st.sidebar:
+    st.markdown("### 🎛️ Navigation")
+    page = st.selectbox("Choose Module:", [
+        "🏠 Dashboard",
+        "🔍 Invoice Reconciliation",
+        "🧠 AI Analysis", 
+        "💬 AI Assistant",
+        "📊 Analytics"
+    ])
+    
+    st.divider()
+    st.markdown("### ℹ️ System Info")
+    st.success("✅ Streamlit in Snowflake")
+    st.success("✅ Document AI Active")
+    try:
+        conn.query("SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', 'test')")
+        st.success("✅ Cortex AI Ready")
+    except:
+        st.warning("⚠️ Cortex AI Limited")
+
+# Main content
+if page == "🏠 Dashboard":
+    show_dashboard()
+elif page == "🔍 Invoice Reconciliation":
+    show_reconciliation()
+elif page == "🧠 AI Analysis":
+    show_ai_analysis()
+elif page == "💬 AI Assistant":
+    show_ai_assistant()
+elif page == "📊 Analytics":
+    show_analytics()
+
+# Footer
+st.divider()
+st.markdown("**🚀 Powered by Snowflake Cortex AI + Document AI**") 

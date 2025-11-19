@@ -4,6 +4,7 @@ USE WAREHOUSE doc_ai_qs_wh;
 USE DATABASE doc_ai_qs_db;
 USE SCHEMA doc_ai_schema;
 
+-- Modified Item Reconciliation Procedure to work without DOCAI_INVOICE_ITEMS
 CREATE OR REPLACE PROCEDURE doc_ai_qs_db.doc_ai_schema.SP_RUN_ITEM_RECONCILIATION()
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -11,184 +12,69 @@ AS
 $$
 DECLARE
   status_message VARCHAR;
-  current_run_timestamp TIMESTAMP_NTZ; -- Use consistent timestamp for the run
+  current_run_timestamp TIMESTAMP_NTZ;
 BEGIN
     current_run_timestamp := CURRENT_TIMESTAMP();
-MERGE INTO doc_ai_qs_db.doc_ai_schema.RECONCILE_RESULTS_ITEMS AS target
-USING(
-    WITH db_items AS (
-    SELECT
-        invoice_id,
-        product_name,
-        quantity,
-        unit_price,
-        total_price,
-        ROW_NUMBER() OVER (
-            PARTITION BY invoice_id, product_name
-            ORDER BY quantity, unit_price, total_price
-        ) as rn_occurrence
-        FROM doc_ai_qs_db.doc_ai_schema.TRANSACT_ITEMS a
-    ),
-    docai_items AS (
-    SELECT
-        invoice_id,
-        product_name,
-        quantity,
-        unit_price,
-        total_price,
-        ROW_NUMBER() OVER (
-            PARTITION BY invoice_id, product_name
-            ORDER BY quantity, unit_price, total_price 
-        ) as rn_occurrence
-    FROM doc_ai_qs_db.doc_ai_schema.DOCAI_INVOICE_ITEMS b
-    ),
-
-    join_table AS (SELECT
-    COALESCE(a.invoice_id, b.invoice_id) as Reconciled_invoice_id,
-    COALESCE(a.product_name, b.product_name) as Reconciled_product_name,
-    COALESCE(a.rn_occurrence, b.rn_occurrence) as Product_Occurrence_Num,
-
-    -- Data from Table A
-    a.quantity AS Quantity_A,
-    a.unit_price AS UnitPrice_A,
-    a.total_price AS TotalPrice_A,
-
-    -- Data from Table B
-    b.quantity AS Quantity_B,
-    b.unit_price AS UnitPrice_B,
-    b.total_price AS TotalPrice_B,
-
-    -- Reconciliation Status and Discrepancies
-    CASE
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN 'Matched Line Item Occurrence'
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In Table A Only'
-        WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In Table B Only'
-    END AS Reconciliation_Status,
-
-    CASE
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN
-            TRIM(
-                COALESCE(IFF(a.quantity <> b.quantity, 'Qty_Diff(' || a.quantity::VARCHAR || ' vs ' || b.quantity::VARCHAR || '); ', ''), '') ||
-                COALESCE(IFF(a.unit_price <> b.unit_price, 'Unit_Price_Diff(' || a.unit_price::VARCHAR || ' vs ' || b.unit_price::VARCHAR || '); ', ''), '') ||
-                COALESCE(IFF(a.total_price <> b.total_price, 'Total_Price_Diff(' || a.total_price::VARCHAR || ' vs ' || b.total_price::VARCHAR || '); ', ''), '')
-                -- Add more detailed discrepancy checks as needed
+    
+    -- Since DOCAI_INVOICE_ITEMS doesn't exist in new schema, we'll create reconcile results
+    -- based only on TRANSACT_ITEMS existence and mark all as needing review
+    MERGE INTO doc_ai_qs_db.doc_ai_schema.RECONCILE_RESULTS_ITEMS AS target
+    USING(
+        WITH ReconciliationSource AS (
+            SELECT
+                invoice_id,
+                'Items exist in TRANSACT_ITEMS but no corresponding DocAI item extraction available' AS item_mismatch_details,
+                'Pending Review' AS review_status,
+                :current_run_timestamp AS last_reconciled_timestamp,
+                NULL AS reviewed_by,
+                NULL AS reviewed_timestamp,
+                NULL as notes
+            FROM (
+                SELECT DISTINCT invoice_id 
+                FROM doc_ai_qs_db.doc_ai_schema.TRANSACT_ITEMS
             )
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In Table A Only'
-        WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In Table B Only'
-        ELSE NULL
-    END AS Discrepancies
-FROM db_items a
-FULL OUTER JOIN docai_items b
-    ON a.invoice_id = b.invoice_id
-    AND a.product_name = b.product_name
-    AND a.rn_occurrence = b.rn_occurrence
-    ),
+        )
+        SELECT * FROM ReconciliationSource
+    ) AS source
+    ON target.invoice_id = source.invoice_id
 
-ReconciliationSource AS (
-SELECT
-    Reconciled_invoice_id AS invoice_id,
-    LISTAGG(
-        DISTINCT CASE
-            WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_product_name || ': ' || discrepancies
-            ELSE NULL
-        END,
-        '; '
-    ) WITHIN GROUP (ORDER BY -- Corrected ORDER BY clause
-                        CASE
-                            WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_product_name || ': ' || discrepancies
-                            ELSE NULL
-                        END
-                   ) AS item_mismatch_details,
-    CASE
-        WHEN item_mismatch_details = '' THEN 'Auto-reconciled'
-        ELSE 'Pending Review'
-    END AS review_status,
-    :current_run_timestamp AS last_reconciled_timestamp,
-    NULL AS reviewed_by,
-    NULL AS reviewed_timestamp,
-    NULL as notes
-    
-FROM
-    join_table 
-GROUP BY
-    Reconciled_invoice_id
-ORDER BY
-    Reconciled_invoice_id
-)
-    -- Select final source for merge
-    SELECT * FROM ReconciliationSource
-  ) AS source
-  ON target.invoice_id = source.invoice_id
+    -- Action when a record for this item instance already exists
+    WHEN MATCHED THEN UPDATE SET
+        target.item_mismatch_details = source.item_mismatch_details,
+        target.review_status = CASE
+                                  WHEN target.review_status = 'Reviewed' THEN target.review_status
+                                  ELSE 'Pending Review'
+                               END,
+        target.last_reconciled_timestamp = :current_run_timestamp,
+        target.reviewed_by = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_by ELSE NULL END,
+        target.reviewed_timestamp = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_timestamp ELSE NULL END,
+        target.notes = CASE WHEN target.review_status = 'Reviewed' THEN target.notes ELSE NULL END
 
-  -- Action when a record for this item instance already exists
-  WHEN MATCHED THEN UPDATE SET
-    target.item_mismatch_details = source.item_mismatch_details, -- Update details if discrepancy changes or becomes null if matched
-    -- Set review status based on whether it's a discrepancy or auto-reconciled
-    target.review_status = CASE
-                              WHEN source.review_status = 'Auto-reconciled' THEN source.review_status
-                              WHEN target.review_status = 'Reviewed' THEN target.review_status
-                              ELSE 'Pending Review' -- Reset to Pending Review if it becomes/remains a discrepancy
-                           END,
-    target.last_reconciled_timestamp = :current_run_timestamp, -- Use variable for consistency
-    -- Reset review/correction fields only if it's now a discrepancy, keep them if auto-reconciled (though likely null anyway)
-    target.reviewed_by = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_by 
-                            WHEN source.review_status != 'Auto-reconciled' THEN NULL 
-                            ELSE target.reviewed_by END,
-    target.reviewed_timestamp = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_timestamp 
-                                WHEN source.review_status != 'Auto-reconciled' THEN NULL
-                                ELSE target.reviewed_timestamp END,
-    target.notes =  CASE WHEN target.review_status = 'Reviewed' THEN target.notes
-                    WHEN source.review_status != 'Auto-reconciled' THEN NULL 
-                    ELSE target.notes END
+    -- Action when a new item is found
+    WHEN NOT MATCHED THEN INSERT (
+        invoice_id,
+        item_mismatch_details,
+        review_status,
+        last_reconciled_timestamp
+    ) VALUES (
+        source.invoice_id,
+        source.item_mismatch_details,
+        source.review_status,
+        :current_run_timestamp
+    );
 
-
-  -- Action when a new discrepancy or auto-reconciled item is found
-  WHEN NOT MATCHED THEN INSERT (
-    invoice_id,
-    item_mismatch_details, -- Will be NULL for auto-reconciled
-    review_status,         -- 'Pending Review' or 'Auto-Reconciled'
-    last_reconciled_timestamp
-  ) VALUES (
-    source.invoice_id,
-    source.item_mismatch_details,
-    source.review_status,
-    :current_run_timestamp  -- Use variable for consistency
-  );
-
-SELECT * FROM TRANSACT_ITEMS;
-
-CREATE OR REPLACE TEMPORARY TABLE ReadyForGold AS(
-    SELECT 
-    *,
-    'Auto-reconciled' AS reviewed_by,
-    :current_run_timestamp AS reviewed_timestamp
-    FROM doc_ai_qs_db.doc_ai_schema.TRANSACT_ITEMS
-    WHERE INVOICE_ID IN (
-        SELECT INVOICE_ID
-        FROM doc_ai_qs_db.doc_ai_schema.RECONCILE_RESULTS_ITEMS
-        WHERE REVIEW_STATUS = 'Auto-reconciled'
-    )
-);
-    
-DELETE FROM doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_ITEMS
-WHERE invoice_id IN (SELECT DISTINCT invoice_id FROM ReadyForGold);
-
--- Step 2: Insert all the new line items from incoming_data.
-INSERT INTO doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_ITEMS (invoice_id, product_name, quantity, unit_price, total_price, reviewed_by, reviewed_timestamp)
-SELECT invoice_id, product_name, quantity, unit_price, total_price, reviewed_by, reviewed_timestamp
-FROM ReadyForGold;
-
-  status_message := 'Item reconciliation executed. Discrepancies and auto-reconciled items merged into RECONCILE_RESULTS_ITEMS. Fully auto-reconciled invoices merged into GOLD_INVOICE_ITEMS.';
-  RETURN status_message;
+    -- Note: No auto-reconciliation for items since we don't have DocAI item data
+    status_message := 'Item reconciliation executed. All items marked as Pending Review due to lack of DocAI item-level data.';
+    RETURN status_message;
 
 EXCEPTION
-  WHEN OTHER THEN
-    status_message := 'Error during item reconciliation: ' || SQLERRM;
-    RETURN status_message; -- Or handle error logging appropriately
+    WHEN OTHER THEN
+        status_message := 'Error during item reconciliation: ' || SQLERRM;
+        RETURN status_message;
 END;
 $$;
 
-
+-- Updated Totals Reconciliation Procedure to work with INVOICE_INFO
 CREATE OR REPLACE PROCEDURE doc_ai_qs_db.doc_ai_schema.SP_RUN_TOTALS_RECONCILIATION()
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -196,148 +82,138 @@ AS
 $$
 DECLARE
   status_message VARCHAR;
-  current_run_timestamp TIMESTAMP_NTZ; -- Use consistent timestamp for the run
+  current_run_timestamp TIMESTAMP_NTZ;
 BEGIN
     current_run_timestamp := CURRENT_TIMESTAMP();
+    
 MERGE INTO doc_ai_qs_db.doc_ai_schema.RECONCILE_RESULTS_TOTALS AS target
 USING(
     WITH db_totals AS (
-    SELECT
-        invoice_id,
-        invoice_date,
-        subtotal,
-        tax,
-        total
+        SELECT
+            invoice_id,
+            invoice_date,
+            subtotal,
+            tax,
+            total
         FROM doc_ai_qs_db.doc_ai_schema.TRANSACT_TOTALS a
     ),
     docai_totals AS (
-    SELECT
-        invoice_id,
-        invoice_date,
-        subtotal,
-        tax,
-        total
-    FROM doc_ai_qs_db.doc_ai_schema.DOCAI_INVOICE_TOTALS b
+        SELECT
+            INVOICE_NO as invoice_id,
+            TRY_CAST(INVOICE_DATE AS DATE) as invoice_date,
+            NULL as subtotal,  -- INVOICE_INFO doesn't have subtotal
+            NULL as tax,       -- INVOICE_INFO doesn't have tax
+            TOTAL_AMOUNT as total
+        FROM doc_ai_qs_db.doc_ai_schema.INVOICE_INFO b
     ),
+    join_table AS (
+        SELECT
+            COALESCE(a.invoice_id, b.invoice_id) as Reconciled_invoice_id,
+            
+            -- Data from Table A (TRANSACT_TOTALS)
+            a.invoice_date AS invoiceDate_A,
+            a.subtotal AS subtotal_A,
+            a.tax AS tax_A,
+            a.total AS total_A,
 
-    join_table AS (SELECT
-    COALESCE(a.invoice_id, b.invoice_id) as Reconciled_invoice_id,
-    
-    -- Data from Table A
-    a.invoice_date AS invoiceDate_A,
-    a.subtotal AS subtotal_A,
-    a.tax AS UnitPrice_A,
-    a.total AS TotalPrice_A,
+            -- Data from Table B (INVOICE_INFO)
+            b.invoice_date AS invoiceDate_B,
+            b.subtotal AS subtotal_B,
+            b.tax AS tax_B,
+            b.total AS total_B,
 
-    -- Data from Table B
-    b.invoice_date AS invoiceDate_B,
-    b.subtotal AS subtotal_B,
-    b.tax AS UnitPrice_B,
-    b.total AS TotalPrice_B,
+            -- Reconciliation Status and Discrepancies
+            CASE
+                WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN 'Matched Invoice'
+                WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In TRANSACT_TOTALS Only'
+                WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In INVOICE_INFO Only'
+            END AS Reconciliation_Status,
 
-    -- Reconciliation Status and Discrepancies
-    CASE
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN 'Matched Line Item Occurrence'
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In Table A Only'
-        WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In Table B Only'
-    END AS Reconciliation_Status,
-
-    CASE
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN
-            TRIM(
-                COALESCE(IFF(a.invoice_date <> b.invoice_date, 'date_Diff(' || a.invoice_date::VARCHAR || ' vs ' || b.invoice_date::VARCHAR || '); ', ''), '') ||
-                COALESCE(IFF(a.subtotal <> b.subtotal, 'subtotal_Diff(' || a.subtotal::VARCHAR || ' vs ' || b.subtotal::VARCHAR || '); ', ''), '') ||
-                COALESCE(IFF(a.tax <> b.tax, 'tax_Diff(' || a.tax::VARCHAR || ' vs ' || b.tax::VARCHAR || '); ', ''), '') ||
-                COALESCE(IFF(a.total <> b.total, 'total_Diff(' || a.total::VARCHAR || ' vs ' || b.total::VARCHAR || '); ', ''), '')
-                -- Add more detailed discrepancy checks as needed
-            )
-        WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In Table A Only'
-        WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In Table B Only'
-        ELSE NULL
-    END AS Discrepancies
-FROM db_totals a
-FULL OUTER JOIN docai_totals b
-    ON a.invoice_id = b.invoice_id
+            CASE
+                WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NOT NULL THEN
+                    TRIM(
+                        COALESCE(IFF(a.invoice_date <> b.invoice_date, 'Date_Diff(' || a.invoice_date::VARCHAR || ' vs ' || b.invoice_date::VARCHAR || '); ', ''), '') ||
+                        COALESCE(IFF(a.total <> b.total, 'Total_Diff(' || a.total::VARCHAR || ' vs ' || b.total::VARCHAR || '); ', ''), '') ||
+                        COALESCE(IFF(a.subtotal IS NOT NULL, 'Subtotal_NotAvailable_In_DocAI; ', ''), '') ||
+                        COALESCE(IFF(a.tax IS NOT NULL, 'Tax_NotAvailable_In_DocAI; ', ''), '')
+                    )
+                WHEN a.invoice_id IS NOT NULL AND b.invoice_id IS NULL THEN 'In TRANSACT_TOTALS Only'
+                WHEN a.invoice_id IS NULL AND b.invoice_id IS NOT NULL THEN 'In INVOICE_INFO Only'
+                ELSE NULL
+            END AS Discrepancies
+        FROM db_totals a
+        FULL OUTER JOIN docai_totals b
+            ON a.invoice_id = b.invoice_id
     ),
-
-ReconciliationSource AS (
-SELECT
-    Reconciled_invoice_id AS invoice_id,
-    LISTAGG(
-        DISTINCT CASE
-            WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_invoice_id || ': ' || discrepancies
-            ELSE NULL
-        END,
-        '; '
-    ) WITHIN GROUP (ORDER BY
-                        CASE
-                            WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_invoice_id || ': ' || discrepancies
-                            ELSE NULL
-                        END
-                   ) AS item_mismatch_details,
-    CASE
-        WHEN item_mismatch_details = '' THEN 'Auto-reconciled'
-        ELSE 'Pending Review'
-    END AS review_status,
-    :current_run_timestamp AS last_reconciled_timestamp,
-    NULL AS reviewed_by,
-    NULL AS reviewed_timestamp,
-    NULL as notes
-    
-FROM
-    join_table 
-GROUP BY
-    Reconciled_invoice_id
-ORDER BY
-    Reconciled_invoice_id
-)
-    -- Select final source for merge
+    ReconciliationSource AS (
+        SELECT
+            Reconciled_invoice_id AS invoice_id,
+            LISTAGG(
+                DISTINCT CASE
+                    WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_invoice_id || ': ' || discrepancies
+                    ELSE NULL
+                END,
+                '; '
+            ) WITHIN GROUP (ORDER BY
+                                CASE
+                                    WHEN discrepancies IS NOT NULL AND discrepancies <> '' THEN Reconciled_invoice_id || ': ' || discrepancies
+                                    ELSE NULL
+                                END
+                           ) AS item_mismatch_details,
+            CASE
+                WHEN item_mismatch_details = '' OR item_mismatch_details IS NULL THEN 'Auto-reconciled'
+                ELSE 'Pending Review'
+            END AS review_status,
+            :current_run_timestamp AS last_reconciled_timestamp,
+            NULL AS reviewed_by,
+            NULL AS reviewed_timestamp,
+            NULL as notes
+        FROM join_table 
+        GROUP BY Reconciled_invoice_id
+        ORDER BY Reconciled_invoice_id
+    )
     SELECT * FROM ReconciliationSource
-  ) AS source
-  ON target.invoice_id = source.invoice_id
+) AS source
+ON target.invoice_id = source.invoice_id
 
-  -- Action when a record for this item instance already exists
-  WHEN MATCHED THEN UPDATE SET
-    target.item_mismatch_details = source.item_mismatch_details, -- Update details if discrepancy changes or becomes null if matched
-    -- Set review status based on whether it's a discrepancy or auto-reconciled
+-- Action when a record for this invoice already exists
+WHEN MATCHED THEN UPDATE SET
+    target.item_mismatch_details = source.item_mismatch_details,
     target.review_status = CASE
                               WHEN source.review_status = 'Auto-reconciled' THEN source.review_status
                               WHEN target.review_status = 'Reviewed' THEN target.review_status
-                              ELSE 'Pending Review' -- Reset to Pending Review if it becomes/remains a discrepancy
+                              ELSE 'Pending Review'
                            END,
-    target.last_reconciled_timestamp = :current_run_timestamp, -- Use variable for consistency
-    -- Reset review/correction fields only if it's now a discrepancy, keep them if auto-reconciled (though likely null anyway)
+    target.last_reconciled_timestamp = :current_run_timestamp,
     target.reviewed_by = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_by 
                             WHEN source.review_status != 'Auto-reconciled' THEN NULL 
                             ELSE target.reviewed_by END,
     target.reviewed_timestamp = CASE WHEN target.review_status = 'Reviewed' THEN target.reviewed_timestamp 
                                 WHEN source.review_status != 'Auto-reconciled' THEN NULL
                                 ELSE target.reviewed_timestamp END,
-    target.notes =  CASE WHEN target.review_status = 'Reviewed' THEN target.notes
+    target.notes = CASE WHEN target.review_status = 'Reviewed' THEN target.notes
                     WHEN source.review_status != 'Auto-reconciled' THEN NULL 
                     ELSE target.notes END
 
-
-  -- Action when a new discrepancy or auto-reconciled item is found
-  WHEN NOT MATCHED THEN INSERT (
+-- Action when a new discrepancy or auto-reconciled invoice is found
+WHEN NOT MATCHED THEN INSERT (
     invoice_id,
-    item_mismatch_details, -- Will be NULL for auto-reconciled
-    review_status,         -- 'Pending Review' or 'Auto-Reconciled'
+    item_mismatch_details,
+    review_status,
     last_reconciled_timestamp
-  ) VALUES (
+) VALUES (
     source.invoice_id,
     source.item_mismatch_details,
     source.review_status,
-    :current_run_timestamp  -- Use variable for consistency
-  );
+    :current_run_timestamp
+);
 
-SELECT * FROM TRANSACT_TOTALS;
-
+-- Create temporary table for auto-reconciled totals
 CREATE OR REPLACE TEMPORARY TABLE ReadyForGold AS(
     SELECT 
-    *,
-    'Auto-reconciled' AS reviewed_by,
-    :current_run_timestamp AS reviewed_timestamp
+        *,
+        'Auto-reconciled' AS reviewed_by,
+        :current_run_timestamp AS reviewed_timestamp
     FROM doc_ai_qs_db.doc_ai_schema.TRANSACT_TOTALS
     WHERE INVOICE_ID IN (
         SELECT INVOICE_ID
@@ -349,22 +225,18 @@ CREATE OR REPLACE TEMPORARY TABLE ReadyForGold AS(
 DELETE FROM doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_TOTALS
 WHERE invoice_id IN (SELECT DISTINCT invoice_id FROM ReadyForGold);
 
--- Step 2: Insert all the new line TOTALS from incoming_data.
+-- Insert auto-reconciled totals into GOLD table
 INSERT INTO doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_TOTALS (invoice_id, invoice_date, subtotal, tax, total, reviewed_by, reviewed_timestamp)
 SELECT invoice_id, invoice_date, subtotal, tax, total, reviewed_by, reviewed_timestamp
 FROM ReadyForGold;
 
--- Clearing our streams of data
-CREATE TEMPORARY TABLE table1 AS SELECT * FROM doc_ai_qs_db.doc_ai_schema.BRONZE_DB_STREAM WHERE 0 = 1;
-CREATE TEMPORARY TABLE table2 AS SELECT * FROM doc_ai_qs_db.doc_ai_schema.BRONZE_DOCAI_STREAM WHERE 0 = 1;
-
-  status_message := 'Item reconciliation executed. Discrepancies and auto-reconciled items merged into RECONCILE_RESULTS_TOTALS. Fully auto-reconciled invoices merged into GOLD_INVOICE_TOTALS.';
-  RETURN status_message;
+status_message := 'Totals reconciliation executed. Discrepancies and auto-reconciled invoices merged into RECONCILE_RESULTS_TOTALS. Fully auto-reconciled invoices merged into GOLD_INVOICE_TOTALS.';
+RETURN status_message;
 
 EXCEPTION
-  WHEN OTHER THEN
-    status_message := 'Error during item reconciliation: ' || SQLERRM;
-    RETURN status_message; -- Or handle error logging appropriately
+    WHEN OTHER THEN
+        status_message := 'Error during totals reconciliation: ' || SQLERRM;
+        RETURN status_message;
 END;
 $$;
 
@@ -388,57 +260,53 @@ CREATE OR REPLACE TABLE doc_ai_qs_db.doc_ai_schema.RECONCILE_RESULTS_TOTALS (
     reviewed_by VARCHAR,
     reviewed_timestamp TIMESTAMP_NTZ,
     notes VARCHAR
-    
 );
 
- -- Gold table for corrected transaction items
+-- Gold table for corrected transaction items
 CREATE OR REPLACE TABLE doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_ITEMS (
     invoice_id VARCHAR,
     product_name VARCHAR,
-    quantity NUMBER, -- Assuming numeric type
-    unit_price DECIMAL(10,2), -- Assuming decimal for currency
-    total_price DECIMAL(10,2), -- Assuming decimal for currency
+    quantity NUMBER,
+    unit_price DECIMAL(10,2),
+    total_price DECIMAL(10,2),
     reviewed_by VARCHAR,
     reviewed_timestamp TIMESTAMP_NTZ,
     notes VARCHAR
-
 );
 
 -- Gold table for corrected transaction totals
 CREATE OR REPLACE TABLE doc_ai_qs_db.doc_ai_schema.GOLD_INVOICE_TOTALS (
     invoice_id VARCHAR,
-    invoice_date DATE, -- Assuming DATE type
-    subtotal DECIMAL(10,2), -- Assuming decimal for currency
-    tax DECIMAL(10,2), -- Assuming decimal for currency
-    total DECIMAL(10,2), -- Assuming decimal for currency
+    invoice_date DATE,
+    subtotal DECIMAL(10,2),
+    tax DECIMAL(10,2),
+    total DECIMAL(10,2),
     reviewed_by VARCHAR,
     reviewed_timestamp TIMESTAMP_NTZ,
     notes VARCHAR
-
 );
 
 -- CREATE A STREAM TO MONITOR THE Bronze db table for new items to pass to our reconciliation task
 CREATE OR REPLACE STREAM doc_ai_qs_db.doc_ai_schema.BRONZE_DB_STREAM 
 ON TABLE doc_ai_qs_db.doc_ai_schema.TRANSACT_TOTALS;
 
+-- CREATE A STREAM TO MONITOR THE INVOICE_INFO table (replaces DOCAI_INVOICE_TOTALS stream)
 CREATE OR REPLACE STREAM doc_ai_qs_db.doc_ai_schema.BRONZE_DOCAI_STREAM 
-ON TABLE doc_ai_qs_db.doc_ai_schema.DOCAI_INVOICE_TOTALS;
+ON TABLE doc_ai_qs_db.doc_ai_schema.INVOICE_INFO;
 
--- CREATE A TASK TO RUN WHEN THE STREAM DETECTS NEW INFO IN OUR MAIN DB TABLE OR DOCAI TABLE
-create or replace task doc_ai_qs_db.doc_ai_schema.RECONCILE
-	warehouse=doc_ai_qs_wh
-	schedule='3 MINUTE'
-	when SYSTEM$STREAM_HAS_DATA('BRONZE_DB_STREAM') OR SYSTEM$STREAM_HAS_DATA('BRONZE_DOCAI_STREAM')
-	as BEGIN
+-- CREATE A TASK TO RUN WHEN THE STREAM DETECTS NEW INFO IN OUR MAIN DB TABLE OR INVOICE_INFO TABLE
+CREATE OR REPLACE TASK doc_ai_qs_db.doc_ai_schema.RECONCILE
+    warehouse=doc_ai_qs_wh
+    schedule='3 MINUTE'
+    when SYSTEM$STREAM_HAS_DATA('BRONZE_DB_STREAM') OR SYSTEM$STREAM_HAS_DATA('BRONZE_DOCAI_STREAM')
+    as BEGIN
         CALL SP_RUN_ITEM_RECONCILIATION();
         CALL SP_RUN_TOTALS_RECONCILIATION();
     END;
 
 ALTER TASK doc_ai_qs_db.doc_ai_schema.RECONCILE RESUME;
-    
 
-
---Kick off our streams + tasks with data entering the original bronze db tables.
+-- Kick off our streams + tasks with data entering the original bronze db tables.
 -- Example INSERT statement for the first few rows
 INSERT INTO doc_ai_qs_db.doc_ai_schema.TRANSACT_ITEMS (invoice_id, product_name, quantity, unit_price, total_price) VALUES
   ('2010', 'Onions (kg)', 4, 4.51, 18.04), 
@@ -502,7 +370,6 @@ INSERT INTO doc_ai_qs_db.doc_ai_schema.TRANSACT_ITEMS (invoice_id, product_name,
   ('2001', 'Onions (kg)', 4, 4.69, 18.76), 
   ('2001', 'Tomatoes (kg)', 2, 6.81, 13.62), 
   ('2001', 'Onions (kg)', 3, 3.86, 11.58);
-    
 
 -- Example INSERT statement for the first few rows
 INSERT INTO doc_ai_qs_db.doc_ai_schema.TRANSACT_TOTALS (invoice_id, invoice_date, subtotal, tax, total) VALUES
@@ -515,4 +382,17 @@ INSERT INTO doc_ai_qs_db.doc_ai_schema.TRANSACT_TOTALS (invoice_id, invoice_date
   ('2004', '2025-04-19', 190.66, 99.99, 309.73), -- Intentionally modify tax from 19.07 -> 99.99 total from 209.73 -> 309.73
   ('2003', '2025-04-18', 144.09, 14.41, 158.50), 
   ('2002', '2025-04-17', 103.01, 23.10, 113.31), -- Intentionally modify tax from 10.30 -> 23.10
-  ('2001', '2025-04-16', 174.68, 17.47, 192.15); 
+  ('2001', '2025-04-16', 174.68, 17.47, 192.15);
+
+-- Sample data for INVOICE_INFO table to test reconciliation
+INSERT INTO doc_ai_qs_db.doc_ai_schema.INVOICE_INFO (INVOICE_NO, CUSTOMER_NO, INVOICE_DATE, TOTAL_AMOUNT, COST_CENTER, file_name, file_size, last_modified, snowflake_file_url) VALUES
+  ('2010', 'CUST001', '2025-04-25', 124.31, 'CC001', 'invoice_2010.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2010.pdf'),
+  ('2009', 'CUST002', '2025-04-24', 256.03, 'CC002', 'invoice_2009.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2009.pdf'),
+  ('2008', 'CUST003', '2025-04-23', 149.23, 'CC001', 'invoice_2008.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2008.pdf'),
+  ('2007', 'CUST001', '2025-04-22', 210.51, 'CC003', 'invoice_2007.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2007.pdf'),
+  ('2006', 'CUST004', '2025-04-21', 291.73, 'CC002', 'invoice_2006.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2006.pdf'),
+  ('2005', 'CUST002', '2025-04-20', 129.60, 'CC001', 'invoice_2005.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2005.pdf'),
+  ('2004', 'CUST003', '2025-04-19', 209.73, 'CC003', 'invoice_2004.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2004.pdf'), -- Different total to test reconciliation
+  ('2003', 'CUST001', '2025-04-18', 158.50, 'CC002', 'invoice_2003.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2003.pdf'),
+  ('2002', 'CUST004', '2025-04-17', 103.01, 'CC001', 'invoice_2002.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2002.pdf'), -- Different total to test reconciliation
+  ('2001', 'CUST002', '2025-04-16', 192.15, 'CC003', 'invoice_2001.pdf', 45000, CURRENT_TIMESTAMP(), 'https://example.com/2001.pdf'); 
